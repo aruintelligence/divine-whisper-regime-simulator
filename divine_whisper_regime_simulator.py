@@ -1,40 +1,17 @@
-from pathlib import Path
-import numpy as np
-import matplotlib.pyplot as plt
-import textwrap
+"""Deterministic, symbolic regime simulation; variables are not empirical measures.
 
-out = Path("/mnt/data/divine_whisper_phase_sim")
-out.mkdir(parents=True, exist_ok=True)
-
-code = r'''
-"""
-Divine Whisper Cognitive Regime Simulator
-
-What this prototype includes
-1) Phase classifier
-2) Orchestrator routing policy
-3) Simulation loop that plots four trajectories
-
-Regimes
-- distracted
-- normal
-- focused
-- breakthrough
-
-Main clarity equation:
-    Psi(t) = [lambda(t) * C(t) * S(t)] / [ (D(t) + eps)^2 * (F(t) + eps) ]
-
-This is a compact research-style prototype intended to be easy to modify.
+Clarity Psi = lambda * C * S / ((D + eps)^2 * (F + eps)), with an
+optional continuous amplification below a distortion threshold.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, asdict
-from typing import Dict, List
+import argparse
+import csv
 import json
 import math
-
-import numpy as np
-import matplotlib.pyplot as plt
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path
+from typing import Dict, List, Optional
 
 
 # ----------------------------
@@ -77,7 +54,22 @@ class SimConfig:
 
     # Breakthrough support
     breakthrough_distortion_threshold: float = 0.16
-    breakthrough_boost: float = 1.80  # nonlinear lift once D is very low
+    phase_distortion_threshold: float = 0.14
+    breakthrough_boost: float = 1.80  # continuous amplification below threshold
+
+    def validate(self) -> None:
+        if not isinstance(self.steps, int) or self.steps < 1:
+            raise ValueError("steps must be a positive integer")
+        if not math.isfinite(self.dt) or not 0 < self.dt <= 0.2:
+            raise ValueError("dt must be finite and in (0, 0.2]")
+        if not math.isfinite(self.eps) or self.eps <= 0:
+            raise ValueError("eps must be finite and positive")
+        if not math.isfinite(self.breakthrough_distortion_threshold) or not 0 < self.breakthrough_distortion_threshold < 5:
+            raise ValueError("boost threshold must be finite and in (0, 5)")
+        if not math.isfinite(self.phase_distortion_threshold) or not 0 < self.phase_distortion_threshold < 5:
+            raise ValueError("phase threshold must be finite and in (0, 5)")
+        if not math.isfinite(self.breakthrough_boost) or self.breakthrough_boost < 0:
+            raise ValueError("boost must be finite and nonnegative")
 
 
 # ----------------------------
@@ -95,13 +87,12 @@ class State:
     psi: float = 0.0  # clarity
 
     def clamp(self) -> None:
-        self.A = float(np.clip(self.A, 0.0, 5.0))
-        self.D = float(np.clip(self.D, 0.01, 5.0))
-        self.C = float(np.clip(self.C, 0.0, 5.0))
-        self.F = float(np.clip(self.F, 0.05, 5.0))
-        self.lam = float(np.clip(self.lam, 0.0, 5.0))
-        self.S = float(np.clip(self.S, 0.0, 5.0))
-        self.psi = float(np.clip(self.psi, 0.0, 500.0))
+        self.A = min(5.0, max(0.0, self.A))
+        self.D = min(5.0, max(0.01, self.D))
+        self.C = min(5.0, max(0.0, self.C))
+        self.F = min(5.0, max(0.05, self.F))
+        self.lam = min(5.0, max(0.0, self.lam))
+        self.S = min(5.0, max(0.0, self.S))
 
 
 # ----------------------------
@@ -121,7 +112,7 @@ class PhaseClassifier:
     def classify(self, s: State) -> str:
         # Hard breakthrough gate first
         if (
-            s.D < 0.14
+            s.D < self.cfg.phase_distortion_threshold
             and s.C > 1.15
             and s.lam > 0.95
             and s.F < 0.55
@@ -153,6 +144,8 @@ class Orchestrator:
     """
 
     def policy(self, phase: str) -> Dict[str, float]:
+        if phase not in {"distracted", "normal", "focused", "breakthrough"}:
+            raise ValueError(f"unknown policy phase: {phase}")
         if phase == "distracted":
             return {
                 "U": 1.20,           # stronger attention input
@@ -233,8 +226,8 @@ class Orchestrator:
 def clarity(s: State, cfg: SimConfig) -> float:
     base = (s.lam * s.C * s.S) / ((s.D + cfg.eps) ** 2 * (s.F + cfg.eps))
 
-    # Nonlinear lift once distortion collapses below threshold.
-    # This creates a genuine phase-transition-like jump.
+    # This piecewise factor is continuous at the threshold. The classifier's
+    # categorical threshold is discrete; the clarity equation is not.
     if s.D < cfg.breakthrough_distortion_threshold:
         collapse_factor = 1.0 + cfg.breakthrough_boost * (
             (cfg.breakthrough_distortion_threshold - s.D) / cfg.breakthrough_distortion_threshold
@@ -270,62 +263,54 @@ def step_dynamics(
     return s2
 
 
-def simulate_case(case: str, cfg: SimConfig) -> Dict[str, List[float]]:
+CASES = ("distracted", "normal", "focused", "high_start")
+
+
+def simulate_case(case: str, cfg: SimConfig, policy: str = "feedback") -> Dict[str, List]:
+    cfg.validate()
+    if policy not in {"feedback", "scripted"}:
+        raise ValueError("policy must be feedback or scripted")
     classifier = PhaseClassifier(cfg)
     orchestrator = Orchestrator()
 
-    # Distinct initial conditions chosen to make the four trajectories visibly separate.
+    # Case names describe initial conditions, not guaranteed final regimes.
     initial_map = {
         "distracted":   State(A=0.18, D=1.55, C=0.25, F=1.45, lam=0.28, S=0.30),
         "normal":       State(A=0.55, D=0.88, C=0.55, F=0.92, lam=0.52, S=0.55),
         "focused":      State(A=0.95, D=0.48, C=0.82, F=0.72, lam=0.72, S=0.78),
-        "breakthrough": State(A=1.08, D=0.32, C=0.92, F=0.65, lam=0.78, S=0.84),
+        "high_start":   State(A=1.08, D=0.32, C=0.92, F=0.65, lam=0.78, S=0.84),
     }
+    if case not in initial_map:
+        raise ValueError(f"unknown initial condition: {case}")
     s = initial_map[case]
     s.psi = clarity(s, cfg)
 
-    hist: Dict[str, List[float]] = {k: [] for k in ["A", "D", "C", "F", "lam", "S", "psi"]}
-    phases: List[str] = []
-
-    # Starting policy anchored to the intended case for trajectory separation.
-    base_phase = case
+    hist: Dict[str, List] = {k: [] for k in ["A", "D", "C", "F", "lam", "S", "psi", "phase", "policy_phase"]}
 
     for t in range(cfg.steps):
-        # Blend classified phase with intended trajectory label to create
-        # stable, interpretable trajectories for each regime.
         inferred_phase = classifier.classify(s)
-
-        # Simple anchoring logic:
-        # - distracted stays conservative
-        # - normal gradually improves but not too far
-        # - focused sustains strong routing
-        # - breakthrough receives preservation routing after crossing threshold
-        if case == "distracted":
+        if policy == "feedback":
+            # The classifier decides routing from the current state.
+            active_phase, shock = inferred_phase, 0.0
+        elif case == "distracted":
             active_phase = "distracted" if t < int(cfg.steps * 0.85) else inferred_phase
-            shock = 0.05 if (t % 27 in (0, 1, 2)) else 0.0
-
+            shock = 0.05 if t % 27 in (0, 1, 2) else 0.0
         elif case == "normal":
-            active_phase = "normal"
-            shock = 0.01 if (t % 55 == 0 and t > 0) else 0.0
-
+            active_phase, shock = "normal", 0.01 if t % 55 == 0 and t > 0 else 0.0
         elif case == "focused":
-            active_phase = "focused"
-            shock = 0.0
-
-        else:  # breakthrough trajectory
-            # Allow focused buildup, then preserve breakthrough if reached.
+            active_phase, shock = "focused", 0.0
+        else:
             active_phase = "focused" if s.D > cfg.breakthrough_distortion_threshold else "breakthrough"
             shock = 0.0
 
         ctrl = orchestrator.policy(active_phase)
         s = step_dynamics(s, ctrl, cfg, shock=shock)
 
-        # Record after update
-        for k in hist.keys():
+        for k in ("A", "D", "C", "F", "lam", "S", "psi"):
             hist[k].append(getattr(s, k))
-        phases.append(classifier.classify(s))
+        hist["phase"].append(classifier.classify(s))
+        hist["policy_phase"].append(active_phase)
 
-    hist["phase"] = phases
     return hist
 
 
@@ -333,28 +318,35 @@ def simulate_case(case: str, cfg: SimConfig) -> Dict[str, List[float]]:
 # Plotting and export
 # ----------------------------
 
-def plot_trajectories(results: Dict[str, Dict[str, List[float]]], cfg: SimConfig, out_png: str) -> None:
-    x = np.arange(cfg.steps) * cfg.dt
+def plot_trajectories(results: Dict[str, Dict[str, List]], cfg: SimConfig, out_png: Path) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("Plotting requires matplotlib: python -m pip install matplotlib") from exc
+    x = [(i + 1) * cfg.dt for i in range(cfg.steps)]
 
     plt.figure(figsize=(11, 6))
     for label, hist in results.items():
-        plt.plot(x, hist["psi"], linewidth=2, label=label.title())
-    plt.xlabel("Time")
-    plt.ylabel("Clarity Ψ(t)")
-    plt.title("Divine Whisper Cognitive Regimes: Clarity Trajectories")
+        plt.plot(x, hist["psi"], linewidth=2, label=label.replace("_", " ").title())
+    plt.xlabel("Simulation time (arbitrary units)")
+    plt.ylabel("Modeled clarity Ψ")
+    plt.title("Symbolic clarity trajectories by initial condition")
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_png, dpi=180)
     plt.close()
 
 
-def export_summary(results: Dict[str, Dict[str, List[float]]], out_json: str) -> None:
-    summary = {}
+def summarize(results: Dict[str, Dict[str, List]], cfg: SimConfig, policy: str) -> dict:
+    cases = {}
     for label, hist in results.items():
         phases = hist["phase"]
-        summary[label] = {
+        first = next((i + 1 for i, phase in enumerate(phases) if phase == "breakthrough"), None)
+        cases[label] = {
             "final_psi": hist["psi"][-1],
             "max_psi": max(hist["psi"]),
+            "final_phase": phases[-1],
+            "first_breakthrough_step": first,
             "final_state": {
                 "A": hist["A"][-1],
                 "D": hist["D"][-1],
@@ -366,52 +358,92 @@ def export_summary(results: Dict[str, Dict[str, List[float]]], out_json: str) ->
             "phase_counts": {
                 p: phases.count(p) for p in sorted(set(phases))
             },
+            "policy_counts": {
+                p: hist["policy_phase"].count(p) for p in sorted(set(hist["policy_phase"]))
+            },
         }
+    return {
+        "scope": "symbolic deterministic model; not a measure of cognition",
+        "policy": policy,
+        "config": asdict(cfg),
+        "cases": cases,
+    }
 
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
+
+def export_csv(results: Dict[str, Dict[str, List]], cfg: SimConfig, out_csv: Path) -> None:
+    with out_csv.open("w", newline="", encoding="utf-8") as file:
+        writer = csv.writer(file)
+        keys = ("A", "D", "C", "F", "lam", "S", "psi", "phase", "policy_phase")
+        writer.writerow(("case", "step", "time", *keys))
+        for case, hist in results.items():
+            for i in range(cfg.steps):
+                writer.writerow((case, i + 1, (i + 1) * cfg.dt, *(hist[key][i] for key in keys)))
 
 
-def main() -> None:
-    cfg = SimConfig()
-    results = {label: simulate_case(label, cfg) for label in ["distracted", "normal", "focused", "breakthrough"]}
+def run(cfg: SimConfig, policy: str = "feedback") -> Dict[str, Dict[str, List]]:
+    return {case: simulate_case(case, cfg, policy) for case in CASES}
 
-    plot_trajectories(results, cfg, "divine_whisper_regimes.png")
-    export_summary(results, "divine_whisper_regimes_summary.json")
 
-    # Also print a compact console summary.
-    print("=== Divine Whisper Regime Summary ===")
-    for label, hist in results.items():
+def boost_comparison(cfg: SimConfig, policy: str, original: dict) -> dict:
+    without = summarize(run(replace(cfg, breakthrough_boost=0), policy), replace(cfg, breakthrough_boost=0), policy)
+    return {
+        "intervention": "Set only breakthrough_boost to zero; same initial conditions and policy",
+        "cases": {
+            case: {
+                "max_psi_with_boost": data["max_psi"],
+                "max_psi_without_boost": without["cases"][case]["max_psi"],
+                "first_breakthrough_step_with_boost": data["first_breakthrough_step"],
+                "first_breakthrough_step_without_boost": without["cases"][case]["first_breakthrough_step"],
+            }
+            for case, data in original["cases"].items()
+        }
+    }
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--steps", type=int, default=220)
+    parser.add_argument("--dt", type=float, default=0.05)
+    parser.add_argument("--boost", type=float, default=1.8)
+    parser.add_argument("--boost-threshold", type=float, default=0.16, help="distortion threshold for clarity amplification")
+    parser.add_argument("--phase-threshold", type=float, default=0.14, help="separate distortion gate for breakthrough label")
+    parser.add_argument("--policy", choices=("feedback", "scripted"), default="feedback")
+    parser.add_argument("--out-dir", type=Path, default=Path("results"))
+    parser.add_argument("--plot", action="store_true", help="write PNG; requires matplotlib")
+    parser.add_argument("--compare-boost", action="store_true", help="write a paired boost=0 ablation")
+    args = parser.parse_args(argv)
+    cfg = SimConfig(steps=args.steps, dt=args.dt, breakthrough_boost=args.boost,
+                    breakthrough_distortion_threshold=args.boost_threshold,
+                    phase_distortion_threshold=args.phase_threshold)
+    try:
+        cfg.validate()
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    results = run(cfg, args.policy)
+    summary = summarize(results, cfg, args.policy)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    (args.out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    export_csv(results, cfg, args.out_dir / "trajectories.csv")
+    if args.compare_boost:
+        comparison = boost_comparison(cfg, args.policy, summary)
+        (args.out_dir / "boost_comparison.json").write_text(json.dumps(comparison, indent=2) + "\n", encoding="utf-8")
+    if args.plot:
+        try:
+            plot_trajectories(results, cfg, args.out_dir / "trajectories.png")
+        except RuntimeError as exc:
+            parser.error(str(exc))
+
+    print(f"=== Symbolic regime simulation ({args.policy} policy) ===")
+    for label, data in summary["cases"].items():
         print(
-            f"{label:>12}: final Ψ={hist['psi'][-1]:8.3f} | "
-            f"max Ψ={max(hist['psi']):8.3f} | "
-            f"final phase={hist['phase'][-1]}"
+            f"{label:>12}: final Ψ={data['final_psi']:8.3f} | "
+            f"max Ψ={data['max_psi']:8.3f} | "
+            f"final phase={data['final_phase']} | "
+            f"first breakthrough step={data['first_breakthrough_step']}"
         )
+    print(f"Results: {args.out_dir}")
 
 
 if __name__ == "__main__":
     main()
-'''
-
-py_path = out / "divine_whisper_regime_simulator.py"
-py_path.write_text(code, encoding="utf-8")
-
-# Execute the generated script to produce outputs
-import subprocess, json, os, textwrap, sys
-result = subprocess.run(
-    ["python", str(py_path)],
-    cwd=str(out),
-    capture_output=True,
-    text=True,
-    check=True
-)
-
-print(result.stdout)
-
-# Show the generated chart inline
-from IPython.display import Image, display
-display(Image(filename=str(out / "divine_whisper_regimes.png")))
-
-print(f"Saved Python script: {py_path}")
-print(f"Saved plot: {out / 'divine_whisper_regimes.png'}")
-print(f"Saved summary JSON: {out / 'divine_whisper_regimes_summary.json'}")
