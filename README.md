@@ -49,3 +49,11 @@ Run the regression suite with `python -m unittest discover -s tests -v`. It chec
 The initial conditions, coefficients, clamps, policy, and classifier were selected for an illustrative dynamical system. Large values are a consequence of a small denominator and clamped state, not evidence of insight or emergence. No external dataset or benchmark validates the model against cognition. The tool writes only to the output directory selected by the user.
 
 See [LICENSE](LICENSE) for terms.
+
+---
+
+### Inward Physics research navigation
+
+[Complete Inward Physics index](https://github.com/aruintelligence/aruintelligence/blob/main/INWARD_PHYSICS.md) · [Daniel Jacob Read IV’s ORCID](https://orcid.org/0009-0000-6133-1872) · [Zenodo DOI series (record index)](https://github.com/aruintelligence/aruintelligence/blob/main/INWARD_PHYSICS.md#zenodo-record-index)
+
+These links index project-authored proposals and simulations; they do not imply independent validation of a physical model.
